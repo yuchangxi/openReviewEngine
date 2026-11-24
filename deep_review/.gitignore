@@ -7,3 +7,4 @@ traces/
 dist/
 .env
 eval_runs/
+datasets/raw/

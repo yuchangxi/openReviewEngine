@@ -29,6 +29,7 @@ class GTIssue(BaseModel):
 
     id: str
     file: str
+    """Empty = the dataset gives no location; the issue may be matched in any file."""
     line: int = Field(ge=1)
     end_line: int = Field(ge=1)
     text: str

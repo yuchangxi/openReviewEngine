@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Sequence
 from typing import Any
@@ -36,6 +37,7 @@ class OpenAICompatClient:
             timeout=cfg.timeout_s,
             max_retries=cfg.max_retries,
             http_client=http_client,
+            default_headers={"User-Agent": cfg.user_agent},
         )
 
     def _request(
@@ -52,6 +54,8 @@ class OpenAICompatClient:
             "temperature": self.cfg.temperature,
             "max_tokens": max_tokens or self.cfg.max_output_tokens,
         }
+        if self.cfg.session_header:
+            kwargs["extra_headers"] = {self.cfg.session_header: session_id(messages)}
         if tools:
             kwargs["tools"] = [t.to_openai() for t in tools]
         if response_model is not None:
@@ -106,6 +110,19 @@ class OpenAICompatClient:
             usage=_usage(resp.usage),
             model=resp.model or self.model,
         )
+
+
+def session_id(messages: Sequence[Message]) -> str:
+    """Stable id for a conversation: a hash of its first two messages (system + shared PR
+    message). Every turn of one agent gets the same id; agents of one review that share the
+    prefix share it too, which routes them to the same prefix cache."""
+    h = hashlib.sha256()
+    for m in messages[:2]:
+        h.update(m.role.encode())
+        h.update(b"\0")
+        h.update((m.content or "").encode())
+        h.update(b"\0")
+    return h.hexdigest()[:32]
 
 
 def _usage(u: Any) -> Usage:

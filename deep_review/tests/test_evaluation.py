@@ -10,6 +10,8 @@ from deep_review.evaluation.aacr import convert_record, import_aacr
 from deep_review.evaluation.dataset import EvalCase, GTIssue, load_cases, save_cases
 from deep_review.evaluation.judge import Judge, line_window_matches
 from deep_review.evaluation.metrics import aggregate, score_case
+from deep_review.evaluation.qodo import convert_record as convert_qodo
+from deep_review.evaluation.qodo import import_qodo
 from deep_review.findings import Finding
 from deep_review.llm import ChatResponse, Message, ScriptedLLM, ToolCall
 from deep_review.prompts.reviewer import SUBMIT_TOOL_NAME
@@ -210,6 +212,94 @@ def test_scoring_is_greedy_and_counts_subsets() -> None:
     assert agg["cost"]["prompt_tokens"] == 100
 
 
+QODO_URL = "https://github.com/agentic-review-benchmarks/Ghost/pull/4"
+QODO_RECORD = {
+    "repo": "Ghost",
+    "pr_url_to_review": QODO_URL,
+    "num_of_issues": 3,
+    "issues": [
+        {
+            "title": "Missing semicolons",
+            "description": "Rule 3 requires semicolons.",
+            "file_path": "ghost/core/a.js",
+            "start_line": 12,
+            "end_line": 10,
+            "problematic_code_snippet": "let a = 1",
+            "rule_name": "Use Semicolons",
+        },
+        {
+            "title": "Delete removed",
+            "description": "Users can no longer delete comments.",
+            "file_path": "None",
+            "start_line": "None",
+            "end_line": "None",
+            "problematic_code_snippet": "<DropdownMenu>",
+        },
+        {
+            "title": "Off by one",
+            "description": "d",
+            "file_path": "/b.js",
+            "start_line": 5,
+            "end_line": 7,
+            "rule_name": None,
+        },
+    ],
+}
+QODO_REFS = {
+    "base_sha": "a" * 40,
+    "head_sha": "b" * 40,
+    "title": "Code Review Bench PR #25799 - Remove delete",
+    "body": "x" * 5000,
+}
+
+
+def test_convert_qodo_record() -> None:
+    c = convert_qodo(QODO_RECORD, QODO_REFS)
+    assert (c.id, c.repo_url, c.language) == (
+        "qodo__Ghost-4",
+        "https://github.com/agentic-review-benchmarks/Ghost.git",
+        "JavaScript",
+    )
+    assert (c.base_sha, c.head_sha, c.title) == ("a" * 40, "b" * 40, "Remove delete")
+    assert c.description.endswith("[truncated]")
+    rule, unlocated, bug = c.ground_truth
+    assert (rule.file, rule.line, rule.end_line, rule.category) == (
+        "ghost/core/a.js",
+        12,
+        12,
+        "maintainability",
+    )
+    assert rule.scope == "rule: Use Semicolons" and "Code: let a = 1" in rule.text
+    assert (unlocated.file, unlocated.line, unlocated.category) == ("", 1, "defect")
+    assert (bug.file, bug.line, bug.end_line) == ("b.js", 5, 7)
+    with pytest.raises(ValueError, match="no base/head refs"):
+        import_qodo([QODO_RECORD], refs={})
+
+
+def test_unlocated_ground_truth_is_offered_for_any_file_but_not_line_window() -> None:
+    case = EvalCase(
+        id="c",
+        source="t",
+        repo_url="r",
+        base_sha="a",
+        head_sha="b",
+        ground_truth=[gt(1, "f.py", 10), gt(2, "", 1)],
+    )
+    result = ReviewResult(
+        repo="r",
+        base_ref="a",
+        head_ref="b",
+        base_sha="a",
+        head_sha="b",
+        merge_base="a",
+        findings=[finding("other.py", 1, "x")],
+    )
+    seen: list[list[str]] = []
+    score_case(case, result, lambda f, refs: (seen.append([g.id for g in refs]) or [], ""))
+    assert seen == [["c#2"]]
+    assert line_window_matches(finding("other.py", 1), [gt(2, "", 1)]) == []
+
+
 def _submit(findings: list[dict]) -> Message:
     return Message.assistant(
         None,
@@ -309,3 +399,55 @@ def test_eval_cli_run_score_compare(tmp_path: Path, upstream, monkeypatch) -> No
     (tmp_path / "eval_runs" / "after").mkdir()
     (tmp_path / "eval_runs" / "after" / "score.json").write_text(json.dumps(score))
     assert cli.main(["eval", "compare", "base", "after"]) == 0
+
+
+def test_llm_errors_fail_the_case_and_rate_limits_stop_the_run(tmp_path: Path, monkeypatch) -> None:
+    import contextlib
+
+    from deep_review.config import load_config
+    from deep_review.evaluation import runner
+
+    class FakeMgr:
+        def sweep_stale(self) -> list[str]:
+            return []
+
+        @contextlib.contextmanager
+        def checkout(self, *a, **k):
+            yield None
+
+    monkeypatch.setattr(runner.WorkspaceManager, "from_config", lambda cfg: FakeMgr())
+    reviewed: list[str] = []
+
+    def fake_review(ws, llm, cfg, pr, tracer, verifier_llm=None):
+        reviewed.append(pr.title)
+        err = "chat completion failed (RateLimitError): 429 usage limit reached"
+        return ReviewResult(
+            repo="r",
+            base_ref="a",
+            head_ref="b",
+            base_sha="a",
+            head_sha="b",
+            merge_base="a",
+            stats={"agents": [{"stop_reason": "llm_error", "error": err}]},
+        )
+
+    monkeypatch.setattr(runner, "review_workspace", fake_review)
+    cases = [
+        EvalCase(id=f"c{i}", source="t", repo_url="r", base_sha="a", head_sha="b", title=f"c{i}")
+        for i in range(3)
+    ]
+    dataset = tmp_path / "ds.jsonl"
+    save_cases(cases, dataset)
+    out = runner.run_dataset(
+        cases,
+        dataset,
+        tmp_path / "run",
+        load_config(env={}),
+        ScriptedLLM([]),
+        parallel=1,
+        record=False,
+    )
+    assert [o.status for o in out] == ["failed", "aborted", "aborted"]
+    assert reviewed == ["c0"]  # quota gone: no further cases were spent
+    assert not (tmp_path / "run" / "cases" / "c0.json").exists()  # incomplete → re-run later
+    assert "RateLimitError" in (tmp_path / "run" / "cases" / "c0.error").read_text()

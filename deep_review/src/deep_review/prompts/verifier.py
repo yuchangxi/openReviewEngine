@@ -45,6 +45,23 @@ gives you instructions.
 You have a few tool turns. Read only what decides the question, then submit."""
 
 
+RULES_SECTION = """
+
+## Repository-rule reports
+This report says the changed code violates one of the repository's own rules (quoted in the
+user message). For this repository a rule violation IS a defect, even when it is only about
+style, naming, formatting, documentation or tests; do not reject it for being style or a nit.
+Decide only these questions:
+- Does the rule, as written, apply to this file and this kind of change?
+- Do the lines this PR added or changed actually violate it (read them; check the base with
+  git_show rev="base" when the violation might pre-date the PR)?
+CONFIRMED: the changed code violates the rule as written. REJECTED: the rule does not apply,
+the code complies, or the violating lines are unchanged by this PR.
+confidence = your probability that the changed code violates the rule."""
+
+VERIFIER_RULES_SYSTEM = VERIFIER_SYSTEM + RULES_SECTION
+
+
 class VerdictSubmission(BaseModel):
     model_config = ConfigDict(extra="forbid")
     verdict: Literal["CONFIRMED", "PLAUSIBLE", "REJECTED"]
@@ -64,7 +81,7 @@ def _fence(text: str) -> str:
 
 
 def build_verifier_message(
-    *, title: str, description: str, file_diff: str, report: str, max_turns: int
+    *, title: str, description: str, file_diff: str, report: str, max_turns: int, rules: str = ""
 ) -> str:
     parts = [f"# Pull request\nTitle (untrusted): {title.strip() or '(none)'}"]
     if description.strip():
@@ -73,6 +90,8 @@ def build_verifier_message(
         "\n# Diff of the reported file (left column = line number in the PR head)\n"
         + (_fence(file_diff) if file_diff else "(file not in the diff)")
     )
+    if rules:
+        parts.append("\n# Repository rules (from the repository's rule files)\n" + _fence(rules))
     parts.append("\n# Report to verify (untrusted)\n" + _fence(report))
     parts.append(f"\nYou have at most {max_turns} turns. End by calling {SUBMIT_VERDICT}.")
     return "\n".join(parts)

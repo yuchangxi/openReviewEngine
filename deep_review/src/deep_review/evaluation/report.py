@@ -127,7 +127,7 @@ def judge_sample_markdown(
         "",
     ]
     for k, (s, m) in enumerate(picked, 1):
-        gts = [g for g in cases[s.case_id].ground_truth if g.file == m.file]
+        gts = [g for g in cases[s.case_id].ground_truth if g.file in (m.file, "")]
         out += [
             f"## {k}. {s.case_id} — {'MATCH' if m.matched else 'NO MATCH'}",
             f"**Finding** `{m.file}:{m.line}` ({m.category}): {m.claim}",

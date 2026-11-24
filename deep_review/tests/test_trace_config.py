@@ -60,7 +60,7 @@ def test_config_defaults_and_overrides(tmp_path: Path) -> None:
         cfg_file, env={"DEEP_REVIEW_MODEL": "from-env", "DEEP_REVIEW_BASE_URL": "http://x/v1"}
     )
     assert cfg.llm.finder_model == "from-env"
-    assert cfg.llm.effective_verifier_model == "deepseek-flash"  # explicit default
+    assert cfg.llm.effective_verifier_model == "from-env"  # follows the finder unless set
     assert cfg.llm.base_url == "http://x/v1"
     assert cfg.aggregate.max_comments_per_pr == 3
 

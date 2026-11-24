@@ -14,7 +14,7 @@ from deep_review.pipeline.dedupe import claim_similarity, dedupe
 from deep_review.pipeline.graph import _chunk_files
 from deep_review.pipeline.rules import discover_rules
 from deep_review.prompts.reviewer import SUBMIT_TOOL_NAME
-from deep_review.prompts.verifier import SUBMIT_VERDICT, VERIFIER_SYSTEM
+from deep_review.prompts.verifier import SUBMIT_VERDICT, VERIFIER_RULES_SYSTEM, VERIFIER_SYSTEM
 from deep_review.review import PRInfo, review_workspace
 
 
@@ -69,8 +69,10 @@ SIG = "add() gained a third parameter c that changes the sum for existing caller
 
 
 def role(messages: list[Message]) -> str:
-    if messages[0].content == VERIFIER_SYSTEM:
+    if messages[0].content in (VERIFIER_SYSTEM, VERIFIER_RULES_SYSTEM):
         return "verifier"
+    if len(messages) == 2:
+        return "warmup"
     focus = messages[2].content or ""
     for name, marker in [
         ("logic", "logic and correctness"),
@@ -86,6 +88,8 @@ def role(messages: list[Message]) -> str:
 
 def standard_route(messages: list[Message]) -> Message:
     r = role(messages)
+    if r == "warmup":
+        return Message.assistant("")
     if r == "logic":
         return submit([cand("lib/util.py", 2, SIG, conf=0.6)])
     if r == "contract":
@@ -103,6 +107,7 @@ def standard_route(messages: list[Message]) -> Message:
 
 
 def cfg(**pipeline):
+    pipeline.setdefault("filter", "verifier")  # most tests here exercise the verifier path
     c = load_config(env={})
     for k, v in pipeline.items():
         setattr(c.pipeline, k, v)
@@ -128,8 +133,12 @@ def test_full_pipeline(ws) -> None:
     assert s["verdict_counts"] == {"CONFIRMED": 1, "REJECTED": 1}
     assert s["specialists"] == ["logic", "contract", "concurrency_resource", "security"]
     assert s["agent_stop_reasons"] == {"specialist:submitted": 4, "verifier:submitted": 2}
+    assert sorted(map(sorted, s["finding_sources"].values())) == [
+        ["contract", "logic"],
+        ["security"],
+    ]
 
-    spec_calls = [m for m in llm.calls if m[0].content != VERIFIER_SYSTEM]
+    spec_calls = [m for m in llm.calls if m[0].content != VERIFIER_SYSTEM and len(m) > 2]
     assert len(spec_calls) == 4
     # identical shared prefix (system + PR/diff) for every specialist → prefix-cache friendly
     assert len({(m[0].content, m[1].content) for m in spec_calls}) == 1
@@ -139,7 +148,7 @@ def test_full_pipeline(ws) -> None:
 
 
 def test_verification_off_and_missing_verdicts(ws) -> None:
-    c = cfg(verify=False)
+    c = cfg(filter="none")
     c.aggregate.plausible_threshold = 0.0
     r = run_pipeline(ws, RoutingLLM(standard_route), c)
     assert {f.verdict for f in r.findings} == {"PLAUSIBLE"} and len(r.findings) == 2
@@ -183,6 +192,32 @@ def test_rules_specialist_runs_when_rules_exist(ws) -> None:
     r = run_pipeline(ws, llm, cfg())
     assert r.stats["specialists"][-1] == "rules" and r.stats["rules_found"]
     assert discover_rules(ws.guard, ["lib/util.py"], max_tokens=5).endswith("[truncated]")
+
+
+def test_rule_findings_get_rules_aware_verifier(ws) -> None:
+    (ws.root / "AGENTS.md").write_text("Rule 1: every module starts with a docstring.\n")
+
+    def route(messages):
+        if role(messages) == "rules":
+            claim = "Rule 1: new.py lacks the required docstring"
+            return submit([cand("new.py", 1, claim, "rules")])
+        if role(messages) == "verifier":
+            return verdict("CONFIRMED", 0.9)
+        return standard_route(messages)
+
+    llm = RoutingLLM(route)
+    r = run_pipeline(ws, llm, cfg())
+    verifiers = [m for m in llm.calls if role(m) == "verifier"]
+    rule_v = [m for m in verifiers if m[0].content == VERIFIER_RULES_SYSTEM]
+    assert len(rule_v) == 1 and "every module starts with a docstring" in (
+        rule_v[0][1].content or ""
+    )
+    assert all(
+        "docstring" not in (m[1].content or "")
+        for m in verifiers
+        if m[0].content == VERIFIER_SYSTEM
+    )
+    assert any("docstring" in f.claim for f in r.findings)
 
 
 def test_review_workspace_dispatches_to_graph(ws) -> None:
@@ -239,6 +274,7 @@ def test_eval_scores_before_and_after_verifier(tmp_path, upstream, monkeypatch) 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("DEEP_REVIEW_CACHE_DIR", str(tmp_path / "cache"))
     monkeypatch.setenv("DEEP_REVIEW_BASE_URL", "http://unused.invalid/v1")
+    monkeypatch.setenv("DEEP_REVIEW_FILTER", "verifier")
     case = EvalCase(
         id="g1",
         source="t",
@@ -304,3 +340,43 @@ def test_dedupe_same_line_across_categories() -> None:
     # same line, unrelated problems: stay apart
     c = "Cache key ignores the tenant id, so users can read each other's entries."
     assert len(dedupe([(f(138, a, "security"), "s"), (f(138, c, "logic"), "l")])) == 2
+
+
+def test_agreement_filters(ws) -> None:
+    # standard_route: logic + contract agree on lib/util.py; only security reports new.py
+    llm = RoutingLLM(standard_route)
+    r = run_pipeline(ws, llm, cfg(filter="agreement"))
+    assert [(f.file, f.verdict) for f in r.findings] == [("lib/util.py", "PLAUSIBLE")]
+    assert r.stats["verdict_counts"] == {"agreement": 1, "single_source": 1}
+    assert not any(m[0].content == VERIFIER_SYSTEM for m in llm.calls)  # no verifier cost
+
+    llm = RoutingLLM(standard_route)
+    r = run_pipeline(ws, llm, cfg(filter="agreement_or_verifier"))
+    verifier_calls = [m for m in llm.calls if m[0].content == VERIFIER_SYSTEM]
+    assert len(verifier_calls) == 1 and "new.py" in verifier_calls[0][1].content
+    assert r.stats["verdict_counts"] == {"agreement": 1, "REJECTED": 1}
+    assert [f.file for f in r.findings] == ["lib/util.py"]  # agreed: exempt from threshold
+
+
+def test_wide_context_and_prefix_warming(ws) -> None:
+    llm = RoutingLLM(standard_route)
+    r = run_pipeline(ws, llm, cfg())
+    assert r.stats["context_lines"] == 40  # the tiny fixture diff fits at the widest setting
+    warm = [m for m in llm.calls if len(m) == 2 and m[0].content != VERIFIER_SYSTEM]
+    specs = [m for m in llm.calls if len(m) == 3]
+    assert len(warm) == 1 and len(specs) == 4
+    assert warm[0][1].content == specs[0][1].content  # same prefix the specialists send
+    assert "up to 40 lines of unchanged context" in specs[0][1].content
+    # with ±40 lines, util.py's untouched line 6 is visible; positions still use ±3
+    assert "     6       return a - b" in specs[0][1].content
+
+    c = cfg(warm_prefix=False, context_lines=[3])
+    llm = RoutingLLM(standard_route)
+    r = run_pipeline(ws, llm, c)
+    assert r.stats["context_lines"] == 3 and not [
+        m for m in llm.calls if len(m) == 2 and m[0].content != VERIFIER_SYSTEM
+    ]
+
+
+def test_default_filter_is_agreement_or_verifier() -> None:
+    assert load_config(env={}).pipeline.filter == "agreement_or_verifier"

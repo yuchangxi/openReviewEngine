@@ -126,3 +126,55 @@ def test_hostile_inputs_are_rejected(tmp_path: Path, upstream: dict, url, base, 
     with pytest.raises(GitError, match="invalid|not allowed"), mgr.checkout(url, base, head):
         pass
     assert not (tmp_path / "cache").exists()  # rejected before touching disk
+
+
+def test_sweep_removes_worktrees_of_killed_jobs(tmp_path: Path, upstream: dict) -> None:
+    import os
+
+    mgr = WorkspaceManager(tmp_path / "cache")
+    cm = mgr.checkout(upstream["url"], "main", "feature", job_id="killed")
+    ws = cm.__enter__()  # simulate a process killed mid-review: no __exit__, no cleanup
+    git_dir = ws.git_dir
+    assert ws.root.exists() and _job_refs(git_dir)
+    with mgr.checkout(upstream["url"], "main", "feature", job_id="live") as live:
+        assert mgr.sweep_stale(max_age_s=3600) == []  # fresh worktrees are left alone
+        old = 1_000_000_000
+        os.utime(ws.root, (old, old))
+        assert mgr.sweep_stale(max_age_s=3600) == ["killed"]
+        assert not ws.root.exists() and live.root.exists()  # the live job is untouched
+        assert "killed" not in _job_refs(git_dir) and "live" in _job_refs(git_dir)
+    assert _job_refs(git_dir) == "" and len(_worktrees(git_dir)) == 1
+    cm.__exit__(None, None, None)  # a late cleanup after the sweep must be harmless
+    assert _job_refs(git_dir) == ""
+
+
+def test_only_transient_git_errors_are_retried(tmp_path, monkeypatch) -> None:
+    from deep_review.errors import GitError
+    from deep_review.workspace import manager as m
+
+    assert m.is_transient(GitError("error: RPC failed; curl 56 GnuTLS recv error (-9)"))
+    assert m.is_transient(GitError("fatal: early EOF"))
+    assert not m.is_transient(GitError("fatal: couldn't find remote ref refs/heads/nope"))
+    assert not m.is_transient(GitError("upload-pack: not our ref deadbeef"))
+
+    monkeypatch.setattr(m, "RETRY_BACKOFF_S", 0.0)
+    mgr = m.WorkspaceManager(tmp_path)
+    calls: list[int] = []
+    undone: list[int] = []
+
+    def flaky() -> None:
+        calls.append(1)
+        if len(calls) < 3:
+            raise GitError("fatal: the remote end hung up unexpectedly")
+
+    mgr._with_retries("x", flaky, undo=lambda: undone.append(1))
+    assert len(calls) == 3 and len(undone) == 2
+
+    def fatal() -> None:
+        calls.append(1)
+        raise GitError("fatal: couldn't find remote ref refs/heads/nope")
+
+    calls.clear()
+    with pytest.raises(GitError):
+        mgr._with_retries("x", fatal)
+    assert len(calls) == 1

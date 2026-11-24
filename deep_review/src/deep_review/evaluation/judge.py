@@ -59,7 +59,8 @@ def _finding_text(f: Finding) -> str:
 def build_judge_prompt(finding: Finding, refs: Sequence[GTIssue]) -> list[Message]:
     lines = ["# Candidate", _finding_text(finding), "", "# References (same file)"]
     for i, g in enumerate(refs, 1):
-        lines.append(f"[{i}] lines {g.line}-{g.end_line}: {g.text}")
+        where = f"lines {g.line}-{g.end_line}" if g.file else "location not given"
+        lines.append(f"[{i}] {where}: {g.text}")
     return [Message.system(JUDGE_SYSTEM), Message.user("\n".join(lines))]
 
 
@@ -138,4 +139,6 @@ class Judge:
 
 def line_window_matches(finding: Finding, refs: Sequence[GTIssue], window: int = 3) -> list[str]:
     start, end = finding.line, finding.end_line or finding.line
-    return [g.id for g in refs if start <= g.end_line + window and g.line - window <= end]
+    return [
+        g.id for g in refs if g.file and start <= g.end_line + window and g.line - window <= end
+    ]

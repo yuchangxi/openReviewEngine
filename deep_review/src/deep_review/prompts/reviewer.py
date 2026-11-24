@@ -179,6 +179,7 @@ def build_user_message(
     diff_text: str,
     omitted: Sequence[str],
     max_turns: int,
+    context_lines: int | None = None,
 ) -> str:
     parts = ["# Pull request"]
     parts.append(f"Title (untrusted): {title.strip() or '(none)'}")
@@ -189,7 +190,14 @@ def build_user_message(
     if skipped:
         parts.append("\nNot for review (generated, vendored, binary, lock files):")
         parts += [f"- {path} ({reason})" for path, reason in skipped]
-    parts.append("\n# Diff (left column = line number in the PR head)")
+    if context_lines is None:
+        parts.append("\n# Diff (left column = line number in the PR head)")
+    else:
+        parts.append(
+            f"\n# Diff with up to {context_lines} lines of unchanged context around each change "
+            "(left column = line number in the PR head). The surrounding code is already here: "
+            "use the tools only for code outside these windows."
+        )
     parts.append(_fence(diff_text) if diff_text else "(no reviewable text changes)")
     if omitted:
         parts.append(

@@ -62,11 +62,12 @@ def score_case(
 ) -> CaseScore:
     by_file: dict[str, list[GTIssue]] = defaultdict(list)
     for g in case.ground_truth:
-        by_file[_norm(g.file)].append(g)
+        by_file[_norm(g.file) if g.file else ""].append(g)
     covered: set[str] = set()
     matches = []
     for f in result.findings:  # already in the engine's rank order
-        ids, reason = matcher(f, by_file.get(_norm(f.file), []))
+        refs = by_file.get(_norm(f.file), []) + by_file.get("", [])
+        ids, reason = matcher(f, refs)
         new = [i for i in ids if i not in covered]
         covered.update(new)
         matches.append(

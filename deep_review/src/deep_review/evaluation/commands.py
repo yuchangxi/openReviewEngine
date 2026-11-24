@@ -1,6 +1,7 @@
 """`deep_review eval ...` subcommands.
 
 import-aacr  convert AACR-Bench JSON into our dataset JSONL
+import-qodo  convert Qodo PR-Review-Bench JSONL into our dataset JSONL
 run          review every case (resumable) into <runs_dir>/<run_id>/
 score        judge findings against ground truth → score.json, report.md, judge_sample.md
 compare      before/after table for two scored runs
@@ -19,6 +20,7 @@ from deep_review.evaluation.aacr import import_aacr
 from deep_review.evaluation.dataset import file_sha256, load_cases, save_cases, select_cases
 from deep_review.evaluation.judge import Judge, line_window_matches
 from deep_review.evaluation.metrics import aggregate, score_run
+from deep_review.evaluation.qodo import import_qodo
 from deep_review.evaluation.report import (
     compare_markdown,
     judge_sample_markdown,
@@ -53,11 +55,16 @@ def add_parsers(sub: argparse._SubParsersAction, parents: list[argparse.Argument
     imp.add_argument("--languages", default="", help="comma-separated, e.g. Java,TypeScript")
     imp.add_argument("--no-meta", action="store_true", help="skip fetching PR title/description")
 
+    imq = ev.add_parser("import-qodo", parents=parents, help="convert Qodo PR-Review-Bench JSONL")
+    imq.add_argument("src", type=Path)
+    imq.add_argument("--out", type=Path, required=True)
+
     run = ev.add_parser("run", parents=parents, help="review every case of a dataset")
     run.add_argument("--dataset", type=Path, required=True)
     run.add_argument("--run-id", required=True)
     run.add_argument("--languages", default="")
     run.add_argument("--cases", default="", help="comma-separated case ids")
+    run.add_argument("--cases-file", type=Path, help="file with one case id per line (# comments)")
     run.add_argument("--limit", type=int)
     run.add_argument("--parallel", type=int)
     run.add_argument("--no-record", action="store_true")
@@ -163,6 +170,10 @@ def main(args: argparse.Namespace, cfg: Config, llm: LLM | None, judge_llm: LLM 
             with_meta=not args.no_meta,
             log=lambda m: print(m, file=sys.stderr),
         )
+    elif cmd == "import-qodo":
+        lines = args.src.read_text(encoding="utf-8").splitlines()
+        cases = import_qodo([json.loads(ln) for ln in lines if ln.strip()])
+    if cmd in ("import-aacr", "import-qodo"):
         save_cases(cases, args.out)
         n_gt = sum(len(c.ground_truth) for c in cases)
         print(f"wrote {len(cases)} cases, {n_gt} ground-truth issues → {args.out}", file=sys.stderr)
@@ -170,10 +181,17 @@ def main(args: argparse.Namespace, cfg: Config, llm: LLM | None, judge_llm: LLM 
 
     runs = cfg.eval.runs_dir
     if cmd == "run":
+        ids = _split(args.cases)
+        if args.cases_file:
+            ids += [
+                ln.split("#", 1)[0].strip()
+                for ln in args.cases_file.read_text().splitlines()
+                if ln.split("#", 1)[0].strip()
+            ]
         cases = select_cases(
             load_cases(args.dataset),
             languages=_split(args.languages),
-            ids=_split(args.cases),
+            ids=ids,
             limit=args.limit,
         )
         llm = llm or OpenAICompatClient(cfg.llm)
@@ -198,11 +216,16 @@ def main(args: argparse.Namespace, cfg: Config, llm: LLM | None, judge_llm: LLM 
             progress=_progress,
         )
         failed = [o for o in outcomes if o.status == "failed"]
-        print(
-            f"{len(outcomes) - len(failed)}/{len(outcomes)} cases ok → {runs / args.run_id}",
-            file=sys.stderr,
-        )
-        return 1 if failed and len(failed) == len(outcomes) else 0
+        aborted = [o for o in outcomes if o.status == "aborted"]
+        ok = len(outcomes) - len(failed) - len(aborted)
+        print(f"{ok}/{len(outcomes)} cases ok → {runs / args.run_id}", file=sys.stderr)
+        if aborted:
+            print(
+                f"stopped after a rate-limit failure; {len(aborted)} cases not started. "
+                "Re-run the same command later to finish (finished cases are skipped).",
+                file=sys.stderr,
+            )
+        return 1 if ok == 0 and (failed or aborted) else 0
 
     if cmd == "score":
         judge_model = cfg.eval.judge_model or cfg.llm.effective_verifier_model

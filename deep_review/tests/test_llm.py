@@ -54,6 +54,7 @@ def _client(handler, **cfg) -> tuple[OpenAICompatClient, list[dict]]:
             {
                 "url": str(request.url),
                 "auth": request.headers.get("authorization"),
+                "headers": dict(request.headers),
                 "body": json.loads(request.content),
             }
         )
@@ -129,6 +130,22 @@ def test_client_structured_output_modes(mode: str) -> None:
     else:
         assert body["response_format"]["json_schema"]["schema"]["title"] == "Verdict"
     assert parse_structured(resp, Verdict) == Verdict(verdict="CONFIRMED", confidence=0.9)
+
+
+def test_client_identifies_itself_and_sends_stable_session() -> None:
+    ok = lambda r: httpx2.Response(200, json=_completion({"role": "assistant", "content": "x"}))  # noqa: E731
+    client, seen = _client(ok, session_header="x-opencode-session")
+    shared = [Message.system("sys"), Message.user("pr diff")]
+    client.chat([*shared, Message.user("focus: logic")])
+    client.chat([*shared, Message.user("focus: security"), Message.user("more")])
+    client.chat([Message.system("sys"), Message.user("other pr")])
+    ids = [s["headers"]["x-opencode-session"] for s in seen]
+    assert ids[0] == ids[1] != ids[2]  # same conversation prefix → same session
+    assert all(s["headers"]["user-agent"] == "deep-review/0.1" for s in seen)
+
+    plain, seen2 = _client(ok)
+    plain.chat(shared)
+    assert "x-opencode-session" not in seen2[0]["headers"]
 
 
 def test_client_wraps_http_errors() -> None:

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import threading
 import time
 import traceback
 from collections.abc import Callable
@@ -28,11 +29,13 @@ from deep_review.review import PRInfo, ReviewResult, review_workspace
 from deep_review.trace import Tracer
 from deep_review.workspace import WorkspaceManager
 
+_RATE_LIMITED = "RateLimitError"
+
 
 @dataclass
 class CaseOutcome:
     case_id: str
-    status: str  # "done" | "skipped" | "failed"
+    status: str  # "done" | "skipped" | "failed" | "aborted"
     seconds: float = 0.0
     error: str = ""
 
@@ -85,11 +88,14 @@ def run_case(
     *,
     record: bool = True,
     verifier_llm: LLM | None = None,
+    stop: threading.Event | None = None,
 ) -> CaseOutcome:
     out_path = run_dir / "cases" / f"{case.id}.json"
     err_path = out_path.with_suffix(".error")
     if out_path.exists():
         return CaseOutcome(case.id, "skipped")
+    if stop is not None and stop.is_set():
+        return CaseOutcome(case.id, "aborted", error="run stopped after a rate-limit failure")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     t0 = time.perf_counter()
     case_llm: LLM = (
@@ -119,7 +125,20 @@ def run_case(
             )
     except Exception as e:  # one bad case must not stop the run
         err_path.write_text(f"{type(e).__name__}: {e}\n\n{traceback.format_exc()}")
+        if stop is not None and _RATE_LIMITED in str(e):
+            stop.set()
         return CaseOutcome(case.id, "failed", time.perf_counter() - t0, f"{type(e).__name__}: {e}")
+    llm_errors = [
+        a.get("error") or ""
+        for a in result.stats.get("agents", [])
+        if a.get("stop_reason") == "llm_error"
+    ]
+    if llm_errors:  # an agent died on the LLM call: the review is incomplete, so it must re-run
+        msg = f"LLMError in {len(llm_errors)} agent(s): {llm_errors[0]}"
+        err_path.write_text(msg + "\n")
+        if stop is not None and _RATE_LIMITED in msg:
+            stop.set()  # set here, not by the caller: the pool would already start the next case
+        return CaseOutcome(case.id, "failed", time.perf_counter() - t0, msg)
     tmp = out_path.with_suffix(".tmp")
     tmp.write_text(result.model_dump_json(indent=2) + "\n", encoding="utf-8")
     tmp.replace(out_path)  # atomic: a crash never leaves a half-written result
@@ -141,11 +160,21 @@ def run_dataset(
 ) -> list[CaseOutcome]:
     write_manifest(run_dir, dataset, cfg, cases)
     mgr = WorkspaceManager.from_config(cfg.workspace)
+    mgr.sweep_stale()
     outcomes: list[CaseOutcome] = []
+    stop = threading.Event()  # set on a rate-limit failure: quota is gone, stop spending cases
     with ThreadPoolExecutor(max_workers=max(parallel, 1)) as pool:
         futures = [
             pool.submit(
-                run_case, c, run_dir, cfg, llm, mgr, record=record, verifier_llm=verifier_llm
+                run_case,
+                c,
+                run_dir,
+                cfg,
+                llm,
+                mgr,
+                record=record,
+                verifier_llm=verifier_llm,
+                stop=stop,
             )
             for c in cases
         ]

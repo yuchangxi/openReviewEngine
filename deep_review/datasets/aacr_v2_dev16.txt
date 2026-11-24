@@ -1,0 +1,22 @@
+# 16-case dev subset of aacr_v2_java_ts_js.jsonl for day-to-day tuning (about 1/3 of the cost).
+# Deterministic: per language, cases sorted by sha256(id); quotas Java 7 / TS 6 / JS 3;
+# at most 3 elasticsearch PRs (slow checkouts); the 4 unreachable keycloak cases excluded.
+# Use full runs for milestone decisions. Measured from cached verdicts: dev16 tracks the
+# full set's level but NOT the gap between variants (F1 gap M1-recall vs M3-specialists:
+# full48 +8.2 pt, dev16 +0.7 pt). Treat dev16 as a smoke test / direction check only.
+elastic__elasticsearch-118895  # Java
+kestra-io__kestra-7381  # Java
+alibaba__spring-ai-alibaba-869  # Java
+elastic__elasticsearch-124403  # Java
+elastic__elasticsearch-120546  # Java
+keycloak__keycloak-40283  # Java
+kestra-io__kestra-7191  # Java
+google-gemini__gemini-cli-5819  # TypeScript
+immich-app__immich-18043  # TypeScript
+google-gemini__gemini-cli-4163  # TypeScript
+google-gemini__gemini-cli-8797  # TypeScript
+cline__cline-5177  # TypeScript
+immich-app__immich-14777  # TypeScript
+mrdoob__three.js-30750  # JavaScript
+bluewave-labs__Checkmate-2883  # JavaScript
+nodejs__node-57691  # JavaScript

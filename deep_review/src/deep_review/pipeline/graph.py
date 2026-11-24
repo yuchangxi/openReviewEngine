@@ -23,7 +23,7 @@ for _var in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"):
 import operator  # noqa: E402
 import time  # noqa: E402
 from collections import Counter  # noqa: E402
-from dataclasses import dataclass  # noqa: E402
+from dataclasses import dataclass, field  # noqa: E402
 from typing import Annotated, Any, TypedDict  # noqa: E402
 
 from langgraph.graph import END, START, StateGraph  # noqa: E402
@@ -52,6 +52,7 @@ from deep_review.prompts.specialists import SPECIALISTS, rules_specialist  # noq
 from deep_review.prompts.verifier import (  # noqa: E402
     SUBMIT_VERDICT,
     VERDICT_DESCRIPTION,
+    VERIFIER_RULES_SYSTEM,
     VERIFIER_SYSTEM,
     VerdictSubmission,
     build_verifier_message,
@@ -82,6 +83,10 @@ class Deps:
     tracer: Tracer
     pr: PRInfo
     prepared: Prepared
+    wide: dict[str, FileDiff] = field(default_factory=dict)
+    """Selected files' diffs at the chosen (wider) context; set by build_context."""
+    rules: str = ""
+    """Repository rules text; set by build_context, shown to verifiers of rule findings."""
 
 
 class State(TypedDict, total=False):
@@ -90,6 +95,7 @@ class State(TypedDict, total=False):
     omitted: list[str]
     specialists: list[dict[str, str]]
     rules_found: bool
+    context_lines: int | None
     candidates: Annotated[list[dict[str, Any]], operator.add]
     agent_runs: Annotated[list[dict[str, Any]], operator.add]
     to_verify: list[dict[str, Any]]
@@ -153,6 +159,41 @@ def _report_text(f: Finding) -> str:
 # ------------------------------------------------------------------ nodes
 
 
+def _widest_fitting(d: Deps, budget: int) -> tuple[list[FileDiff], int | None]:
+    """Selected files rendered with the widest context that fits the budget in one chunk.
+    Positions are still checked against the ±3-line diff in `prepared`, never the wide one."""
+    selected = [f.path for f in d.prepared.selected]
+    for lines in d.cfg.pipeline.context_lines:
+        if lines == 3:
+            wide = {f.path: f for f in d.prepared.selected}
+        else:
+            parsed = {f.path: f for f in d.ws.file_diffs(context_lines=lines)}
+            wide = {p: parsed.get(p) for p in selected}
+            if any(v is None for v in wide.values()):
+                continue  # rename detection differed at this width; try the next one
+        files = [wide[p] for p in selected]
+        if not render_diff(files, budget).omitted:
+            d.wide = wide  # type: ignore[assignment]
+            return files, lines
+    d.wide = {f.path: f for f in d.prepared.selected}
+    return list(d.prepared.selected), None
+
+
+def _warm_prefix(d: Deps, system_prompt: str, user: str) -> None:
+    """Populate the prompt cache with the shared prefix (same messages and tools as the
+    specialists send) before they start in parallel. Failure is harmless."""
+    specs = [t.spec for t in default_tools()] + [
+        SubmitTool(SUBMIT_TOOL_NAME, SUBMIT_DESCRIPTION, ReviewSubmission).spec
+    ]
+    try:
+        resp = d.llm.chat(
+            [Message.system(system_prompt), Message.user(user)], tools=specs, max_tokens=16
+        )
+        d.tracer.event("warm_prefix", usage=resp.usage.model_dump())
+    except Exception as e:  # noqa: BLE001 - warming is an optimisation only
+        d.tracer.event("warm_prefix_failed", error=str(e))
+
+
 def build_context(state: State, runtime: Runtime[Deps]) -> State:
     d = runtime.context
     cfg, prep = d.cfg, d.prepared
@@ -161,9 +202,9 @@ def build_context(state: State, runtime: Runtime[Deps]) -> State:
         d.ws.guard, [f.path for f in prep.selected], cfg.pipeline.max_rules_tokens
     )
     fixed = estimate_tokens(system_prompt + d.pr.title + d.pr.description + rules) + 1_500
-    chunks, omitted = _chunk_files(
-        prep.selected, max(cfg.budgets.shared_prefix_tokens - fixed, 2_000)
-    )
+    budget = max(cfg.budgets.shared_prefix_tokens - fixed, 2_000)
+    files_for_render, context_lines = _widest_fitting(d, budget)
+    chunks, omitted = _chunk_files(files_for_render, budget)
     files = [(f.path, f.status, f.additions, f.deletions) for f in prep.selected]
     skipped = [(f.path, r.value) for f, r in prep.skipped]
     users = [
@@ -175,19 +216,24 @@ def build_context(state: State, runtime: Runtime[Deps]) -> State:
             diff_text=text,
             omitted=[p for p in (f.path for f in prep.selected) if p not in set(shown)],
             max_turns=cfg.pipeline.specialist_max_turns,
+            context_lines=context_lines,
         )
         for text, shown in chunks
     ]
+    if cfg.pipeline.warm_prefix and users:
+        _warm_prefix(d, system_prompt, users[0])
     specs = [
         {"name": SPECIALISTS[n].name, "focus": SPECIALISTS[n].focus}
         for n in cfg.pipeline.specialists
     ]
+    d.rules = rules
     if rules:
         rs = rules_specialist(rules)
         specs.append({"name": rs.name, "focus": rs.focus})
     d.tracer.event(
         "context",
         chunks=len(users),
+        context_lines=context_lines,
         omitted=omitted,
         specialists=[s["name"] for s in specs],
         rules_chars=len(rules),
@@ -199,6 +245,7 @@ def build_context(state: State, runtime: Runtime[Deps]) -> State:
         "omitted": omitted,
         "specialists": specs,
         "rules_found": bool(rules),
+        "context_lines": context_lines,
     }
 
 
@@ -297,10 +344,18 @@ def dedupe_node(state: State, runtime: Runtime[Deps]) -> State:
     return {"to_verify": to_verify, "pre_dropped": dropped}
 
 
+def _agreed(item: dict[str, Any], cfg: Config) -> bool:
+    return len(item.get("sources", [])) >= cfg.pipeline.min_agreement
+
+
+def _needs_verifier(item: dict[str, Any], cfg: Config) -> bool:
+    mode = cfg.pipeline.filter
+    return mode == "verifier" or (mode == "agreement_or_verifier" and not _agreed(item, cfg))
+
+
 def fan_out_verify(state: State, runtime: Runtime[Deps]) -> list[Send] | str:
-    if not runtime.context.cfg.pipeline.verify:
-        return "aggregate"
-    sends = [Send("verify", item) for item in state.get("to_verify", [])]
+    cfg = runtime.context.cfg
+    sends = [Send("verify", it) for it in state.get("to_verify", []) if _needs_verifier(it, cfg)]
     return sends or "aggregate"
 
 
@@ -308,20 +363,23 @@ def verify(payload: dict[str, Any], runtime: Runtime[Deps]) -> State:
     d = runtime.context
     cfg = d.cfg
     f = Finding.model_validate(payload["finding"])
-    fd = next((x for x in d.prepared.all_diffs if x.path == f.file), None)
+    fd = d.wide.get(f.file) or next((x for x in d.prepared.all_diffs if x.path == f.file), None)
+    is_rule = bool(d.rules) and any(s.startswith("rules#") for s in payload.get("sources", []))
     user = build_verifier_message(
         title=d.pr.title,
         description=d.pr.description,
-        file_diff=render_file(fd)[: cfg.budgets.shared_prefix_tokens] if fd else "",
+        file_diff=render_file(fd)[: cfg.budgets.shared_prefix_tokens * 3] if fd else "",
         report=_report_text(f),
         max_turns=cfg.pipeline.verifier_max_turns,
+        rules=d.rules if is_rule else "",
     )
-    with d.tracer.span("verifier", finding=f.id):
+    system = VERIFIER_RULES_SYSTEM if is_rule else VERIFIER_SYSTEM
+    with d.tracer.span("verifier", finding=f.id, rules=is_rule):
         r = run_agent(
             d.verifier_llm,
             default_tools(),
             ToolContext.for_workspace(d.ws, cfg.tools),
-            [Message.system(VERIFIER_SYSTEM), Message.user(user)],
+            [Message.system(system), Message.user(user)],
             SubmitTool(SUBMIT_VERDICT, VERDICT_DESCRIPTION, VerdictSubmission),
             max_turns=cfg.pipeline.verifier_max_turns,
             context_budget_tokens=cfg.budgets.shared_prefix_tokens + cfg.budgets.tool_turn_tokens,
@@ -343,7 +401,7 @@ def aggregate(state: State, runtime: Runtime[Deps]) -> State:
     cfg = d.cfg
     known = {f.path for f in d.prepared.all_diffs}
     verdicts = {v["finding_id"]: v["verdict"] for v in state.get("verdicts", [])}
-    verified = cfg.pipeline.verify
+    mode = cfg.pipeline.filter
     pre: list[dict[str, Any]] = []
     kept: dict[str, Finding] = {}
     dropped = list(state.get("pre_dropped", []))
@@ -351,8 +409,20 @@ def aggregate(state: State, runtime: Runtime[Deps]) -> State:
     for item in state.get("to_verify", []):
         f = Finding.model_validate(item["finding"])
         pre.append(f.model_dump())
-        if not verified:
+        accepted = False  # accepted by agreement: exempt from the confidence threshold
+        if mode == "none":
             out = f
+        elif mode in ("agreement", "agreement_or_verifier") and _agreed(item, cfg):
+            counts["agreement"] += 1
+            out, accepted = f, True
+        elif mode == "agreement":
+            counts["single_source"] += 1
+            dropped.append(
+                Dropped(
+                    reason="single_source", file=f.file, line=f.line, claim=f.claim
+                ).model_dump()
+            )
+            continue
         else:
             v = verdicts.get(f.id)
             if v is None:  # verifier gave no verdict: keep, but never above the cap
@@ -385,7 +455,11 @@ def aggregate(state: State, runtime: Runtime[Deps]) -> State:
                         "evidence": (f.evidence + extra)[:8],
                     }
                 )
-        if out.verdict != "CONFIRMED" and out.confidence < cfg.aggregate.plausible_threshold:
+        if (
+            not accepted
+            and out.verdict != "CONFIRMED"
+            and out.confidence < cfg.aggregate.plausible_threshold
+        ):
             dropped.append(
                 Dropped(
                     reason="below_threshold", file=out.file, line=out.line, claim=out.claim
@@ -473,6 +547,7 @@ def run_pipeline(
         stop_reason="completed",
         specialists=[s["name"] for s in state.get("specialists", [])],
         diff_chunks=len(state.get("chunks", [])),
+        context_lines=state.get("context_lines"),
         diff_files_omitted=state.get("omitted", []),
         rules_found=state.get("rules_found", False),
         candidates=total("candidates", "specialist"),
@@ -489,6 +564,10 @@ def run_pipeline(
         verifier_prompt_tokens=total("prompt_tokens", "verifier"),
         peak_context_tokens=max((r["peak_context_tokens"] for r in runs), default=0),
         agents=runs,
+        finding_sources={
+            it["finding"]["id"]: [x.split("#")[0] for x in it.get("sources", [])]
+            for it in state.get("to_verify", [])
+        },
         duration_s=round(time.perf_counter() - t0, 1),
     )
     result.stats = stats

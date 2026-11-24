@@ -33,7 +33,7 @@ class LLMConfig(_Section):
     api_key_env: str = "DEEP_REVIEW_API_KEY"
     """Name of the env var (or .env entry) holding the key — never the key itself."""
     finder_model: str = "deepseek-flash"
-    verifier_model: str = "deepseek-flash"
+    verifier_model: str = ""
     """Empty → same as finder_model."""
     context_tokens: int = Field(100_000, gt=0)
     max_output_tokens: int = Field(8_000, gt=0)
@@ -43,6 +43,12 @@ class LLMConfig(_Section):
     structured_output: Literal["json_schema", "json_object"] = "json_schema"
     """How schema-bound output is requested. vLLM supports json_schema; the public DeepSeek
     API rejects it (400) and needs json_object."""
+    user_agent: str = "deep-review/0.1"
+    """Our own client name (gateways such as OpenCode Go require one, not an SDK default)."""
+    session_header: str = ""
+    """Header that carries a stable per-conversation id (e.g. `x-opencode-session`); the id
+    is derived from the conversation's first two messages, so agents sharing a prompt prefix
+    share a session and land on the same prefix cache. Empty → not sent."""
 
     def api_key(self, env: Mapping[str, str] | None = None) -> str:
         env = os.environ if env is None else env
@@ -69,7 +75,8 @@ class WorkspaceConfig(_Section):
     cache_dir: Path = Field(default_factory=_default_cache_dir)
     git_timeout_s: float = Field(120.0, gt=0)
     fetch_timeout_s: float = Field(600.0, gt=0)
-    lock_timeout_s: float = Field(900.0, gt=0)
+    lock_timeout_s: float = Field(3_600.0, gt=0)
+    """Waiting for another job's fetch + first checkout of the same repo (slow networks)."""
 
 
 class ToolLimits(_Section):
@@ -110,14 +117,31 @@ class PipelineConfig(_Section):
         default_factory=lambda: ["logic", "contract", "concurrency_resource", "security"]
     )
     """The repo-rules specialist is added automatically when rules files are found."""
-    specialist_max_turns: int = Field(12, gt=0)
-    verify: bool = True
+    specialist_max_turns: int = Field(10, gt=0)
+    context_lines: list[int] = Field(default_factory=lambda: [40, 20, 10, 3])
+    """Diff context widths to try for the shared prefix, widest first; the first that fits the
+    prefix budget in one chunk wins. M3 traces: 62% of file reads were of changed files and 80%
+    re-read a path another agent had already read, so this context is cheaper in the prefix."""
+    warm_prefix: bool = True
+    """One tiny call with the shared prefix before the fan-out, so the parallel specialists hit
+    the prompt cache instead of all paying for the same uncached prefix."""
+    filter: Literal["verifier", "agreement", "agreement_or_verifier", "none"] = (
+        "agreement_or_verifier"
+    )
+    """How candidates are filtered after dedupe:
+    verifier: one fresh-context verifier per candidate (PLAN §4.4);
+    agreement: keep only candidates that >= min_agreement specialists reported independently;
+    agreement_or_verifier: agreed candidates pass, single-source ones go to the verifier;
+    none: keep everything (threshold and cap still apply).
+    M3 eval (m3-graph-flash): with deepseek-flash the verifier kept 46% of real and 42% of
+    unmatched findings, while agreement scored P 39 / R 22 vs the verifier's P 34 / R 18."""
+    min_agreement: int = Field(2, ge=2)
     verifier_max_turns: int = Field(8, gt=0)
     max_candidates_to_verify: int = Field(30, gt=0)
     max_concurrency: int = Field(6, gt=0)
     """Parallel agent loops inside one review (LangGraph max_concurrency)."""
     dedupe_line_window: int = Field(3, ge=0)
-    max_rules_tokens: int = Field(4_000, gt=0)
+    max_rules_tokens: int = Field(8_000, gt=0)
 
 
 class EvalConfig(_Section):
@@ -161,11 +185,13 @@ ENV_OVERRIDES: dict[str, tuple[str, str]] = {
     "DEEP_REVIEW_VERIFIER_MODEL": ("llm", "verifier_model"),
     "DEEP_REVIEW_CONTEXT_TOKENS": ("llm", "context_tokens"),
     "DEEP_REVIEW_STRUCTURED_OUTPUT": ("llm", "structured_output"),
+    "DEEP_REVIEW_SESSION_HEADER": ("llm", "session_header"),
     "DEEP_REVIEW_CACHE_DIR": ("workspace", "cache_dir"),
     "DEEP_REVIEW_TRACE_DIR": ("trace", "dir"),
     "DEEP_REVIEW_JUDGE_MODEL": ("eval", "judge_model"),
     "DEEP_REVIEW_FINDER_MODE": ("review", "finder_mode"),
     "DEEP_REVIEW_PIPELINE": ("pipeline", "mode"),
+    "DEEP_REVIEW_FILTER": ("pipeline", "filter"),
 }
 
 
